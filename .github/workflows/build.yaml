@@ -1,102 +1,76 @@
-#Todo application
-name: CI/CD Pipeline
+name: CI/CD Todo Application
 
 on:
   push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
+    branches: [ main ]
 
 env:
-  DOCKER_IMAGE_NAME: ramanijadala/todo-app   # change this
-  AWS_REGION: us-east-1
-  EKS_CLUSTER_NAME: cluster
-  # Add other env as needed
+  DOCKER_HUB_USER: sonu171
+  IMAGE_BASE: todo-app
+  NAMESPACE: todons
 
 jobs:
-  build_and_test:
-    name: Build & Test
+  ci-cd:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
+    # ---------------- CHECKOUT ----------------
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 18
+    # ---------------- SONARQUBE SCAN ----------------
+    - name: SonarQube Scan
+      uses: sonarsource/sonarqube-scan-action@v2
+      env:
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-      - name: Install dependencies (backend)
-        working-directory: ./backend
-        run: npm install
+    # ---------------- QUALITY GATE ----------------
+    - name: SonarQube Quality Gate
+      uses: sonarsource/sonarqube-quality-gate-action@v1.1.0
+      timeout-minutes: 2
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
-      - name: Start backend in background
-        working-directory: ./backend
-        run: |
-         nohup node server.js > server.log 2>&1 &
-         sleep 5
+    # ---------------- DOCKER BUILD ----------------
+    - name: Build Docker Image
+      run: |
+        docker build -t $DOCKER_HUB_USER/$IMAGE_BASE:build-${{ github.run_number }} .
+
+    # ---------------- DOCKER LOGIN ----------------
+    - name: Login to Docker Hub
+      run: |
+        echo "${{ secrets.DOCKER_PASSWORD }}" | docker login \
+          -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+
+    # ---------------- DOCKER PUSH ----------------
+    - name: Push Docker Image
+      run: |
+        docker push $DOCKER_HUB_USER/$IMAGE_BASE:build-${{ github.run_number }}
+
+    # ---------------- KUBECONFIG ----------------
+    - name: Configure kubeconfig
+      run: |
+        mkdir -p ~/.kube
+        echo "${{ secrets.KUBE_CONFIG_DATA }}" | base64 -d > ~/.kube/config
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
 
 
-  build_and_push_image:
-    name: Build & Push Docker Image
-    needs: build_and_test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
+    # ---------------- EKS DEPLOY ----------------
+    - name: Deploy to EKS using Helm
+      run: |
+        helm upgrade --install todo-release ./helm \
+          --namespace $NAMESPACE \
+          --create-namespace \
+          --set image.repository=$DOCKER_HUB_USER/$IMAGE_BASE \
+          --set image.tag=build-${{ github.run_number }} \
+          --set service.type=LoadBalancer
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Build and tag Docker image
-        run: |
-          docker build -t $DOCKER_IMAGE_NAME:${{ github.sha }} .
-          docker tag $DOCKER_IMAGE_NAME:${{ github.sha }} $DOCKER_IMAGE_NAME:latest
-
-      - name: Push images
-        run: |
-          docker push $DOCKER_IMAGE_NAME:${{ github.sha }}
-          docker push $DOCKER_IMAGE_NAME:latest
-
-  deploy:
-    name: Deploy to EKS
-    needs: build_and_push_image
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-          
-      - name: Install eksctl
-        run: |
-            curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /usr/local/bin
-            eksctl version
-    
-      - name: Update kubeconfig for EKS
-        run: eksctl utils write-kubeconfig --cluster cluster --region us-east-1
-    
-      - name: Verify cluster nodes
-        run: kubectl get nodes
-
-      - name: Deploy via Helm
-        run: |
-          helm upgrade --install todo-app ./helm \
-            -f ./helm/Values.yaml \
-            --set image.repository=$DOCKER_IMAGE_NAME \
-            --set image.tag=${{ github.sha }} \
-            --namespace todo \
-            --create-namespace \
-            --set service.type=LoadBalancer \
-            --set service.port=3000
-
+        sleep 60
+        kubectl get svc -n $NAMESPACE
